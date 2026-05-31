@@ -1,10 +1,13 @@
-// Renown — VS Code extension (v0). Two jobs:
-//   1. Status bar HUD — your live renown (score + level) from the configured renown server,
+// Renown — VS Code extension (v1). Three surfaces:
+//   1. Status bar HUD — your live renown (score + this-week delta + level/pets in the tooltip),
 //      clickable to open your profile.
 //   2. Activity heartbeats — while you actively edit a repo, after N minutes of activity it asks
 //      the renown server to recompute your renown for that repo (server-side, from your real
 //      GitHub commits — the same path the CLI's `renown ci-sync` uses). Editing is just the
-//      *trigger*; the score is always GitHub-verified, never self-reported.
+//      *trigger*; the score is always GitHub-verified, never self-reported. On sync it toasts the
+//      actual "+X renown / +N pets" delta from /verify.
+//   3. Sidebar panel — your badge, this week's recap, this repo's /project board, and the
+//      achievements you unlocked this week (a webview of the server-rendered surfaces).
 //
 // Config: renown.endpoint (API base, e.g. https://renown.example.com/api), renown.login,
 // renown.heartbeatMinutes, renown.statusRefreshSeconds.
@@ -36,14 +39,18 @@ const fmt = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : 
 export function activate(context: vscode.ExtensionContext) {
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusItem.command = "renown.openProfile";
+  panel = new RenownPanel();
   context.subscriptions.push(
     statusItem,
+    vscode.window.registerWebviewViewProvider("renown.panel", panel),
     vscode.commands.registerCommand("renown.openProfile", openProfile),
     vscode.commands.registerCommand("renown.syncNow", () => syncActiveRepo(true)),
     vscode.commands.registerCommand("renown.setLogin", setLogin),
     vscode.commands.registerCommand("renown.openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", "renown")),
+    vscode.commands.registerCommand("renown.refreshPanel", () => panel?.refresh()),
     vscode.workspace.onDidChangeTextDocument((e) => onEdit(e.document)),
-    vscode.workspace.onDidChangeConfiguration((e) => { if (e.affectsConfiguration("renown")) void refreshStatus(); }),
+    vscode.workspace.onDidChangeConfiguration((e) => { if (e.affectsConfiguration("renown")) { void refreshStatus(); panel?.refresh(); } }),
+    vscode.window.onDidChangeActiveTextEditor(() => panel?.refresh()),   // board follows the active repo
   );
 
   void refreshStatus();
@@ -94,10 +101,24 @@ async function syncRepoAt(folderPath: string, notify: boolean) {
   const repo = await repoOf(folderPath);
   const post = (path: string, body: unknown) =>
     fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).catch(() => undefined);
-  await post("/verify", { login: who });                                   // global renown (base + attribution + pets + skills)
+  const vr = await post("/verify", { login: who });                        // global renown (base + attribution + pets + skills)
+  let delta = 0, newPets = 0;
+  if (vr?.ok) {
+    try {
+      const j = (await vr.json()) as { attributionDelta?: number; newPetSeeds?: unknown[]; newPets?: number };
+      delta = Number(j.attributionDelta ?? 0);
+      newPets = Array.isArray(j.newPetSeeds) ? j.newPetSeeds.length : Number(j.newPets ?? 0);
+    } catch { /* non-JSON / throttled */ }
+  }
   if (repo) await post("/ci/repo-sync", { repo, logins: [who] });          // this repo's verified board entry
-  if (notify) vscode.window.showInformationMessage(`Renown: synced ${repo ?? `@${who}`}.`);
+  if (notify) {
+    const bits: string[] = [];
+    if (delta > 0) bits.push(`+${fmt(delta)} renown`);
+    if (newPets > 0) bits.push(`+${newPets} pet${newPets === 1 ? "" : "s"}`);
+    vscode.window.showInformationMessage(bits.length ? `Renown: ${bits.join(" · ")}${repo ? ` on ${repo}` : ""} 🎉` : `Renown: synced${repo ? ` ${repo}` : ""} — no new attribution since last sync.`);
+  }
   await refreshStatus();
+  panel?.refresh();
 }
 
 async function syncActiveRepo(notify: boolean) {
@@ -128,15 +149,17 @@ async function refreshStatus() {
   }
   statusItem.command = "renown.openProfile";
   try {
-    const r = await fetch(`${base}/profile/${encodeURIComponent(who)}`, { signal: AbortSignal.timeout(8000) });
+    // /recap gives score + total level + pets AND the 7-day delta in one call (richer than /profile).
+    const r = await fetch(`${base}/recap/${encodeURIComponent(who)}`, { signal: AbortSignal.timeout(8000) });
     if (!r.ok) throw new Error(`status ${r.status}`);
-    const p = (await r.json()) as { score?: number; totalLevel?: number; error?: string };
+    const p = (await r.json()) as { error?: string; currentScore?: number; totalLevel?: number; petsCount?: number; attributionDelta?: number };
     if (p.error) {
       statusItem.text = `$(flame) renown: @${who}?`;
       statusItem.tooltip = `${who} isn't on renown yet — link your account, then commit.`;
     } else {
-      statusItem.text = `$(flame) ${fmt(p.score ?? 0)} renown`;
-      statusItem.tooltip = `@${who} · total level ${p.totalLevel ?? 0}\nClick to open your renown profile`;
+      const wk = Number(p.attributionDelta ?? 0);
+      statusItem.text = `$(flame) ${fmt(p.currentScore ?? 0)} renown${wk > 0 ? ` $(arrow-up)${fmt(wk)}` : ""}`;
+      statusItem.tooltip = `@${who} · total level ${p.totalLevel ?? 0} · ${fmt(p.petsCount ?? 0)} pets${wk > 0 ? `\n+${fmt(wk)} renown this week` : ""}\nClick to open your renown profile`;
     }
   } catch {
     statusItem.text = "$(flame) renown $(warning)";
@@ -158,5 +181,76 @@ async function setLogin() {
   if (v !== undefined) {
     await cfg().update("login", v.trim(), vscode.ConfigurationTarget.Global);
     void refreshStatus();
+    panel?.refresh();
   }
+}
+
+// --- Sidebar panel: weekly recap + this repo's board + recent achievements -----------------
+let panel: RenownPanel | undefined;
+
+class RenownPanel implements vscode.WebviewViewProvider {
+  private view?: vscode.WebviewView;
+  resolveWebviewView(view: vscode.WebviewView) {
+    this.view = view;
+    view.webview.options = { enableScripts: false, enableCommandUris: true };
+    view.onDidChangeVisibility(() => { if (view.visible) void this.refresh(); });
+    void this.refresh();
+  }
+  async refresh() {
+    if (this.view) this.view.webview.html = await renderPanel();
+  }
+}
+
+async function activeRepo(): Promise<string | null> {
+  const active = vscode.window.activeTextEditor?.document.uri;
+  const folder = (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
+  return folder ? repoOf(folder.uri.fsPath) : null;
+}
+
+const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function panelShell(origin: string, body: string): string {
+  // No scripts; allow images from the renown origin (the badge/board SVGs are served there).
+  // command: links work via enableCommandUris on the webview.
+  const imgSrc = `${origin ? origin + " " : ""}https: http: data:`;
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline';">
+<style>
+  body { font: 13px var(--vscode-font-family); color: var(--vscode-foreground); padding: 10px 12px; }
+  img { max-width: 100%; display: block; border-radius: 6px; margin: 2px 0; }
+  .stat { margin: 10px 0; }
+  .stat b { color: var(--vscode-charts-green, #86efac); }
+  h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; opacity: .65; margin: 16px 0 6px; }
+  .ach { padding: 4px 0; border-bottom: 1px solid var(--vscode-panel-border, rgba(255,255,255,.08)); }
+  a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .btn { display: inline-block; margin: 8px 0; padding: 5px 11px; border-radius: 6px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .muted { opacity: .6; }
+</style></head><body>${body}</body></html>`;
+}
+
+async function renderPanel(): Promise<string> {
+  const base = endpoint(), who = login();
+  if (!base) return panelShell("", `<p class="muted">Set <code>renown.endpoint</code> to your renown server and your weekly renown + this repo's board show up here.</p><a class="btn" href="command:renown.openSettings">Open settings</a>`);
+  if (!who) return panelShell("", `<p class="muted">Set your GitHub login to see your renown.</p><a class="btn" href="command:renown.setLogin">Set login</a>`);
+  const origin = base.replace(/\/api$/, "");
+  const enc = encodeURIComponent(who);
+  type PanelRecap = { error?: string; attributionDelta?: number; newAchievements?: { id: string; name: string }[] };
+  let recap: PanelRecap | null = null;
+  try { const r = await fetch(`${base}/recap/${enc}`, { signal: AbortSignal.timeout(8000) }); if (r.ok) recap = (await r.json()) as PanelRecap; } catch { /* offline → render what we can */ }
+  const repo = await activeRepo();
+  const achs = recap?.newAchievements ?? [];
+  const wk = Number(recap?.attributionDelta ?? 0);
+  const body = `
+    <a href="${origin}/profile/${enc}"><img src="${origin}/profile/${enc}/badge.svg" alt="renown badge"></a>
+    ${recap && !recap.error
+      ? `<div class="stat">this week: <b>+${fmt(wk)}</b> renown · <b>${achs.length}</b> achievement${achs.length === 1 ? "" : "s"}</div>`
+      : `<p class="muted">@${escHtml(who)} isn't on renown yet — link your account and commit.</p>`}
+    <a class="btn" href="command:renown.syncNow">⟳ Sync this repo</a>
+    ${repo
+      ? `<h3>${escHtml(repo)}</h3><a href="${origin}/project/${repo}"><img src="${origin}/project/${repo}/board.svg" alt="${escHtml(repo)} leaderboard"></a>`
+      : `<p class="muted">Open a GitHub repo to see its leaderboard.</p>`}
+    ${achs.length ? `<h3>Unlocked this week</h3>${achs.slice(0, 8).map((a) => `<div class="ach"><a href="${origin}/achievement/${encodeURIComponent(a.id)}">${escHtml(a.name)}</a></div>`).join("")}` : ""}
+    <p style="margin-top:14px"><a href="${origin}/profile/${enc}">Open full profile →</a> &nbsp;·&nbsp; <a href="${origin}/recap/${enc}">your week →</a></p>`;
+  return panelShell(origin, body);
 }
