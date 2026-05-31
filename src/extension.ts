@@ -20,7 +20,16 @@ const activeMinutes = new Map<string, number>();   // workspace folder → accum
 const lastEditAt = new Map<string, number>();       // workspace folder → last edit timestamp (ms)
 
 const cfg = () => vscode.workspace.getConfiguration("renown");
-const endpoint = () => (cfg().get<string>("endpoint") ?? "").trim().replace(/\/+$/, "");
+// Once renown is hosted, set HOSTED_DEFAULT to the public API base (e.g. https://renown.app/api).
+// Then `renown.endpoint` becomes OPTIONAL — users only set it to override (self-hosted / local
+// dev). Empty for now: there's no hosted renown yet, so the endpoint must be configured (e.g.
+// http://localhost:7777/api against a locally-run `bun run start` in renown/web). See the
+// renown-hosted-endpoint project note.
+const HOSTED_DEFAULT = "";
+const endpoint = () => {
+  const v = (cfg().get<string>("endpoint") || "").trim();
+  return (v || HOSTED_DEFAULT).replace(/\/+$/, "");
+};
 const login = () => (cfg().get<string>("login") ?? "").trim();
 const fmt = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1_000)}k` : n.toLocaleString("en-US"));
 

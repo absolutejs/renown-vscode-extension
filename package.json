@@ -23,7 +23,7 @@
         "renown.endpoint": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Your renown server's API base URL, e.g. `https://renown.example.com/api`. Leave blank to disable."
+          "markdownDescription": "Your renown server's API base URL. **Once renown is hosted this defaults to the hosted URL and won't need setting** — only set it to override (self-hosted / local dev), e.g. `http://localhost:7777/api` against a locally-run `bun run start` in `renown/web`."
         },
         "renown.login": {
           "type": "string",
