@@ -32,6 +32,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("renown.openProfile", openProfile),
     vscode.commands.registerCommand("renown.syncNow", () => syncActiveRepo(true)),
     vscode.commands.registerCommand("renown.setLogin", setLogin),
+    vscode.commands.registerCommand("renown.openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", "renown")),
     vscode.workspace.onDidChangeTextDocument((e) => onEdit(e.document)),
     vscode.workspace.onDidChangeConfiguration((e) => { if (e.affectsConfiguration("renown")) void refreshStatus(); }),
   );
@@ -101,7 +102,14 @@ async function syncActiveRepo(notify: boolean) {
 
 async function refreshStatus() {
   const base = endpoint(), who = login();
-  if (!base) { statusItem.hide(); return; }
+  // Always show a presence so the extension is discoverable even before it's configured.
+  if (!base) {
+    statusItem.text = "$(flame) Renown: set up";
+    statusItem.tooltip = "Click to set your renown server endpoint (renown.endpoint)";
+    statusItem.command = "renown.openSettings";
+    statusItem.show();
+    return;
+  }
   if (!who) {
     statusItem.text = "$(account) Renown: set login";
     statusItem.tooltip = "Click to set your GitHub login";
