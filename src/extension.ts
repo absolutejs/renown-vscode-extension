@@ -112,29 +112,38 @@ async function syncRepoAt(folderPath: string, mode: SyncMode) {
   showSyncing(repo);                                                       // subtle $(sync~spin) in the status bar
   const post = (path: string, body: unknown) =>
     fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).catch(() => undefined);
-  let delta = 0, newPets = 0;
+  let delta = 0, newSeeds: string[] = [];
   try {
     const vr = await post("/verify", { login: who });                      // global renown (base + attribution + pets + skills)
     if (vr?.ok) {
       try {
-        const j = (await vr.json()) as { attributionDelta?: number; newPetSeeds?: unknown[]; newPets?: number };
+        const j = (await vr.json()) as { attributionDelta?: number; newPetSeeds?: unknown[] };
         delta = Number(j.attributionDelta ?? 0);
-        newPets = Array.isArray(j.newPetSeeds) ? j.newPetSeeds.length : Number(j.newPets ?? 0);
+        newSeeds = Array.isArray(j.newPetSeeds) ? j.newPetSeeds.filter((s): s is string => typeof s === "string" && s.length > 0) : [];
       } catch { /* non-JSON / throttled */ }
     }
     if (repo) await post("/ci/repo-sync", { repo, logins: [who] });        // this repo's verified board entry
   } finally {
     syncingRepo = null;
   }
-  // Manual sync always reports (incl. the "nothing new" case so the click feels acknowledged);
-  // a background heartbeat only interrupts you when you actually earned something.
+  await refreshStatus();
+  panel?.refresh();
+  // Headline the loot. New 1/1 pets get the celebration: a manual sync opens it (you asked); a
+  // background heartbeat stays out of the way — it toasts with a "Show" button instead. Otherwise
+  // just a quiet renown toast; a manual no-op still acknowledges the click.
+  const newPets = newSeeds.length;
   const bits: string[] = [];
   if (delta > 0) bits.push(`+${fmt(delta)} renown`);
   if (newPets > 0) bits.push(`+${newPets} pet${newPets === 1 ? "" : "s"}`);
-  if (bits.length) vscode.window.showInformationMessage(`Renown: ${bits.join(" · ")}${repo ? ` on ${repo}` : ""} 🎉`);
-  else if (mode === "manual") vscode.window.showInformationMessage(`Renown: synced${repo ? ` ${repo}` : ""} — no new attribution since last sync.`);
-  await refreshStatus();
-  panel?.refresh();
+  if (newPets > 0) {
+    const head = `Renown: ${bits.join(" · ")} — new pet${newPets === 1 ? "" : "s"} hatched!${repo ? ` on ${repo}` : ""} 🎉`;
+    if (mode === "manual") { vscode.window.showInformationMessage(head); celebrateNewPets(newSeeds, repo); }
+    else if (await vscode.window.showInformationMessage(head, "Show new pet") === "Show new pet") celebrateNewPets(newSeeds, repo);
+  } else if (bits.length) {
+    vscode.window.showInformationMessage(`Renown: ${bits.join(" · ")}${repo ? ` on ${repo}` : ""} 🎉`);
+  } else if (mode === "manual") {
+    vscode.window.showInformationMessage(`Renown: synced${repo ? ` ${repo}` : ""} — no new attribution since last sync.`);
+  }
 }
 
 async function syncActiveRepo(mode: SyncMode) {
@@ -224,6 +233,46 @@ async function setLogin() {
     void refreshStatus();
     panel?.refresh();
   }
+}
+
+// --- New-pet celebration: when a sync mints new 1/1 pets, show the actual creatures -----------
+let celebration: vscode.WebviewPanel | undefined;
+
+function celebrateNewPets(seeds: string[], repo: string | null) {
+  const base = endpoint(), who = login();
+  if (!base || !who || seeds.length === 0) return;
+  const origin = base.replace(/\/api$/, ""), enc = encodeURIComponent(who);
+  if (!celebration) {
+    celebration = vscode.window.createWebviewPanel("renownNewPet", "🎉 New pet!", { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, { enableScripts: false, enableCommandUris: true });
+    celebration.onDidDispose(() => { celebration = undefined; });
+  }
+  celebration.title = seeds.length > 1 ? `🎉 ${seeds.length} new pets!` : "🎉 New pet!";
+  const cards = seeds.slice(0, 6)
+    .map((s) => `<a href="${origin}/profile/${enc}" title="Open your profile"><img class="pet" src="${origin}/pet/${encodeURIComponent(s)}/card.svg" alt="new pet"></a>`)
+    .join("");
+  const body = `
+    <h1>You hatched ${seeds.length === 1 ? "a new pet" : `${seeds.length} new pets`}! 🎉</h1>
+    <p class="muted">Minted from your latest verified commits${repo ? ` on ${escHtml(repo)}` : ""}. Each is a 1/1 — procedurally generated from the commit, so no one else has it.</p>
+    <div class="pets">${cards}</div>
+    <p style="margin-top:18px"><a class="btn" href="${origin}/profile/${enc}">See all your pets →</a></p>`;
+  celebration.webview.html = celebrationShell(origin, body);
+  celebration.reveal(vscode.ViewColumn.Beside, true);
+}
+
+function celebrationShell(origin: string, body: string): string {
+  const imgSrc = `${origin ? origin + " " : ""}https: http: data:`;
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${imgSrc}; style-src 'unsafe-inline';">
+<style>
+  body { font: 13px var(--vscode-font-family); color: var(--vscode-foreground); padding: 28px 24px; text-align: center; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  .muted { opacity: .7; max-width: 440px; margin: 0 auto 22px; line-height: 1.45; }
+  .pets { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; }
+  .pet { width: 240px; max-width: 46vw; border-radius: 14px; display: block; }
+  a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+  .btn { display: inline-block; padding: 7px 14px; border-radius: 6px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+  .btn:hover { background: var(--vscode-button-hoverBackground); }
+</style></head><body>${body}</body></html>`;
 }
 
 // --- Sidebar panel: weekly recap + this repo's board + recent achievements -----------------
