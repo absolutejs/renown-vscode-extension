@@ -10,6 +10,8 @@
 //      this repo's /project board, and the achievements you unlocked this week (a webview of the
 //      server-rendered surfaces).
 //
+// Identity comes from VS Code's built-in GitHub sign-in (renown.signIn) — a proven login, shown
+// verified. renown.login is just an optional override (self-hosted / view-as).
 // Config: renown.endpoint (API base, e.g. https://renown.example.com/api), renown.login,
 // renown.heartbeatMinutes, renown.statusRefreshSeconds.
 import * as vscode from "vscode";
@@ -24,6 +26,7 @@ const activeMinutes = new Map<string, number>();   // workspace folder → accum
 const lastEditAt = new Map<string, number>();       // workspace folder → last edit timestamp (ms)
 const lastSyncAt = new Map<string, number>();       // workspace folder → last sync timestamp (ms)
 let syncingRepo: string | null = null;              // non-null while a sync is in flight (drives the spinner)
+let ghSession: vscode.AuthenticationSession | undefined;   // VS Code's GitHub session, when signed in
 
 const cfg = () => vscode.workspace.getConfiguration("renown");
 // Once renown is hosted, set HOSTED_DEFAULT to the public API base (e.g. https://renown.app/api).
@@ -36,7 +39,13 @@ const endpoint = () => {
   const v = (cfg().get<string>("endpoint") || "").trim();
   return (v || HOSTED_DEFAULT).replace(/\/+$/, "");
 };
-const login = () => (cfg().get<string>("login") ?? "").trim();
+// The GitHub login VS Code has authenticated us as (empty when signed out).
+const verifiedLogin = () => (ghSession?.account.label ?? "").trim();
+// Effective login: an explicit renown.login override wins (self-hosted / impersonation for testing),
+// otherwise the signed-in GitHub identity.
+const login = () => (cfg().get<string>("login") ?? "").trim() || verifiedLogin();
+// True when the effective login is the one GitHub authenticated us as — i.e. proven, not typed.
+const isVerified = () => { const v = verifiedLogin(); return !!v && login().toLowerCase() === v.toLowerCase(); };
 const fmt = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1_000)}k` : n.toLocaleString("en-US"));
 
 export function activate(context: vscode.ExtensionContext) {
@@ -48,6 +57,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.registerWebviewViewProvider("renown.panel", panel),
     vscode.commands.registerCommand("renown.openProfile", openProfile),
     vscode.commands.registerCommand("renown.syncNow", () => syncActiveRepo("manual")),
+    vscode.commands.registerCommand("renown.signIn", () => signIn(true)),
     vscode.commands.registerCommand("renown.setLogin", setLogin),
     vscode.commands.registerCommand("renown.openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", "renown")),
     vscode.commands.registerCommand("renown.refreshPanel", () => panel?.refresh()),
@@ -56,8 +66,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidSaveTextDocument((doc) => onEdit(doc)),   // saving also counts as activity
     vscode.workspace.onDidChangeConfiguration((e) => { if (e.affectsConfiguration("renown")) { void refreshStatus(); panel?.refresh(); } }),
     vscode.window.onDidChangeActiveTextEditor(() => panel?.refresh()),   // board follows the active repo
+    vscode.authentication.onDidChangeSessions((e) => { if (e.provider.id === "github") void adoptSession(); }),
   );
 
+  void adoptSession();   // silently pick up an existing GitHub session, then render
   void refreshStatus();
   const statusEvery = Math.max(30, cfg().get<number>("statusRefreshSeconds") ?? 90) * 1000;
   timers.push(setInterval(() => void refreshStatus(), statusEvery));
@@ -177,9 +189,9 @@ async function refreshStatus() {
     return;
   }
   if (!who) {
-    statusItem.text = "$(account) Renown: set login";
-    statusItem.tooltip = "Click to set your GitHub login";
-    statusItem.command = "renown.setLogin";
+    statusItem.text = "$(github) Renown: sign in";
+    statusItem.tooltip = "Sign in with GitHub to see your renown";
+    statusItem.command = "renown.signIn";
     statusItem.show();
     return;
   }
@@ -195,7 +207,8 @@ async function refreshStatus() {
     } else {
       const wk = Number(p.attributionDelta ?? 0);
       statusItem.text = `$(flame) ${fmt(p.currentScore ?? 0)} renown${wk > 0 ? ` $(arrow-up)${fmt(wk)}` : ""}`;
-      statusItem.tooltip = `@${who} · total level ${p.totalLevel ?? 0} · ${fmt(p.petsCount ?? 0)} pets${wk > 0 ? `\n+${fmt(wk)} renown this week` : ""}${heartbeatHint()}\nClick to open your renown profile`;
+      const ident = isVerified() ? `@${who} $(verified-filled) signed in with GitHub` : `@${who} (set via renown.login)`;
+      statusItem.tooltip = `${ident} · total level ${p.totalLevel ?? 0} · ${fmt(p.petsCount ?? 0)} pets${wk > 0 ? `\n+${fmt(wk)} renown this week` : ""}${heartbeatHint()}\nClick to open your renown profile`;
     }
   } catch {
     statusItem.text = "$(flame) renown $(warning)";
@@ -227,8 +240,40 @@ function openProfile() {
   void vscode.env.openExternal(vscode.Uri.parse(`${origin}/profile/${encodeURIComponent(who)}`));
 }
 
+// Sign in through VS Code's built-in GitHub provider — the real OAuth flow, no client_id/secret
+// of our own. We use the resulting identity's login as the (proven) renown login. `interactive`
+// false is the silent startup adopt; true is the explicit command (may pop the auth UI).
+async function signIn(interactive: boolean) {
+  try {
+    const session = await vscode.authentication.getSession("github", ["read:user"], interactive ? { createIfNone: true } : { createIfNone: false, silent: true });
+    if (!session) { if (interactive) void vscode.window.showWarningMessage("Renown: GitHub sign-in was dismissed."); return; }
+    ghSession = session;
+    // Clear a stale manual override so the proven identity is what's used (an override only makes
+    // sense when it differs from who you're signed in as — keep it then).
+    const override = (cfg().get<string>("login") ?? "").trim();
+    if (override && override.toLowerCase() === session.account.label.toLowerCase()) {
+      await cfg().update("login", "", vscode.ConfigurationTarget.Global);
+    }
+    if (interactive) void vscode.window.showInformationMessage(`Renown: signed in as @${session.account.label}.`);
+  } catch (e) {
+    if (interactive) void vscode.window.showWarningMessage(`Renown: GitHub sign-in failed — ${e instanceof Error ? e.message : String(e)}`);
+  }
+  void refreshStatus();
+  panel?.refresh();
+}
+
+// Startup / session-change hook: adopt an existing GitHub session without prompting.
+const adoptSession = () => signIn(false);
+
+// Manual override — set an explicit renown.login (self-hosted, or to view as someone else). The
+// primary path is GitHub sign-in; this is the escape hatch.
 async function setLogin() {
-  const v = await vscode.window.showInputBox({ prompt: "Your GitHub login (for renown)", value: login(), placeHolder: "octocat" });
+  const pick = !ghSession
+    ? await vscode.window.showQuickPick(["Sign in with GitHub", "Enter a login manually"], { placeHolder: "How do you want to set your renown identity?" })
+    : "Enter a login manually";
+  if (pick === undefined) return;
+  if (pick === "Sign in with GitHub") { await signIn(true); return; }
+  const v = await vscode.window.showInputBox({ prompt: "GitHub login to view as (overrides the signed-in identity)", value: (cfg().get<string>("login") ?? "").trim(), placeHolder: "octocat" });
   if (v !== undefined) {
     await cfg().update("login", v.trim(), vscode.ConfigurationTarget.Global);
     void refreshStatus();
@@ -340,7 +385,7 @@ function panelShell(origin: string, body: string): string {
 async function renderPanel(): Promise<string> {
   const base = endpoint(), who = login();
   if (!base) return panelShell("", `<p class="muted">Set <code>renown.endpoint</code> to your renown server and your weekly renown + this repo's board show up here.</p><a class="btn" href="command:renown.openSettings">Open settings</a>`);
-  if (!who) return panelShell("", `<p class="muted">Set your GitHub login to see your renown.</p><a class="btn" href="command:renown.setLogin">Set login</a>`);
+  if (!who) return panelShell("", `<p class="muted">Sign in with GitHub to see your renown, pets, and this repo's board.</p><a class="btn" href="command:renown.signIn">Sign in with GitHub</a>`);
   const origin = base.replace(/\/api$/, "");
   const enc = encodeURIComponent(who);
   type PanelRecap = { error?: string; attributionDelta?: number; newAchievements?: { id: string; name: string }[] };
