@@ -343,7 +343,7 @@ function celebrateNewPets(seeds: string[], repo: string | null, preview = false)
   }
   celebration.title = preview ? "🐾 Pet preview" : seeds.length > 1 ? `🎉 ${seeds.length} new pets!` : "🎉 New pet!";
   const cards = seeds.slice(0, 6)
-    .map((s) => `<a href="${origin}/profile/${enc}" title="Open your profile"><img class="pet" src="${origin}/pet/${encodeURIComponent(s)}/card.svg" alt="${preview ? "pet" : "new pet"}"></a>`)
+    .map((s) => `<a href="${origin}/pet/${encodeURIComponent(s)}" title="Open this pet's page"><img class="pet" src="${origin}/pet/${encodeURIComponent(s)}/card.svg" alt="${preview ? "pet" : "new pet"}"></a>`)
     .join("");
   const head = preview
     ? `<h1>This is what a hatch looks like 🐾</h1><p class="muted">A preview of your celebration. Commit verified work and a brand-new 1/1 pops up here automatically.</p>`
