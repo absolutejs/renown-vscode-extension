@@ -6,8 +6,9 @@
 //      GitHub commits — the same path the CLI's `renown ci-sync` uses). Editing is just the
 //      *trigger*; the score is always GitHub-verified, never self-reported. On sync it toasts the
 //      actual "+X renown / +N pets" delta from /verify.
-//   3. Sidebar panel — your badge, this week's recap, this repo's /project board, and the
-//      achievements you unlocked this week (a webview of the server-rendered surfaces).
+//   3. Sidebar panel — your badge, this week's recap, your pets (the /profile pets.svg roster),
+//      this repo's /project board, and the achievements you unlocked this week (a webview of the
+//      server-rendered surfaces).
 //
 // Config: renown.endpoint (API base, e.g. https://renown.example.com/api), renown.login,
 // renown.heartbeatMinutes, renown.statusRefreshSeconds.
@@ -287,6 +288,9 @@ async function renderPanel(): Promise<string> {
       ? `<div class="stat">this week: <b>+${fmt(wk)}</b> renown · <b>${achs.length}</b> achievement${achs.length === 1 ? "" : "s"}</div>`
       : `<p class="muted">@${escHtml(who)} isn't on renown yet — link your account and commit.</p>`}
     <a class="btn" href="command:renown.syncNow">⟳ Sync this repo</a>
+    ${recap && !recap.error
+      ? `<h3>Your pets</h3><a href="${origin}/profile/${enc}" title="Open your profile"><img src="${origin}/profile/${enc}/pets.svg" alt="your pets"></a>`
+      : ""}
     ${repo
       ? `<h3>${escHtml(repo)}</h3><a href="${origin}/project/${repo}"><img src="${origin}/project/${repo}/board.svg" alt="${escHtml(repo)} leaderboard"></a>`
       : `<p class="muted">Open a GitHub repo to see its leaderboard.</p>`}
