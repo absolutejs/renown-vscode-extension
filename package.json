@@ -1,0 +1,58 @@
+{
+  "name": "renown-vscode",
+  "displayName": "Renown",
+  "description": "Earn renown for real dev work — a live status bar + activity-driven sync, right in your editor. Talks to your renown server.",
+  "version": "0.1.0",
+  "publisher": "absolutejs",
+  "license": "BSL-1.1",
+  "private": true,
+  "repository": { "type": "git", "url": "https://github.com/absolutejs/renown-vscode-extension.git" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other", "SCM Providers"],
+  "main": "./out/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "renown.openProfile", "title": "Renown: Open My Profile" },
+      { "command": "renown.syncNow", "title": "Renown: Sync This Repo Now" },
+      { "command": "renown.setLogin", "title": "Renown: Set GitHub Login" }
+    ],
+    "configuration": {
+      "title": "Renown",
+      "properties": {
+        "renown.endpoint": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Your renown server's API base URL, e.g. `https://renown.example.com/api`. Leave blank to disable."
+        },
+        "renown.login": {
+          "type": "string",
+          "default": "",
+          "description": "Your GitHub login (for the status bar + repo sync). Auto-detected from the repo's origin owner if blank."
+        },
+        "renown.heartbeatMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "Minutes of active editing in a repo before its renown is refreshed (a debounced server-side recompute from GitHub)."
+        },
+        "renown.statusRefreshSeconds": {
+          "type": "number",
+          "default": 90,
+          "minimum": 30,
+          "description": "How often the status bar re-fetches your renown from the server."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.9.3"
+  }
+}
