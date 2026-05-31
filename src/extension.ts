@@ -51,6 +51,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("renown.setLogin", setLogin),
     vscode.commands.registerCommand("renown.openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", "renown")),
     vscode.commands.registerCommand("renown.refreshPanel", () => panel?.refresh()),
+    vscode.commands.registerCommand("renown.previewPet", previewPet),
     vscode.workspace.onDidChangeTextDocument((e) => onEdit(e.document)),
     vscode.workspace.onDidSaveTextDocument((doc) => onEdit(doc)),   // saving also counts as activity
     vscode.workspace.onDidChangeConfiguration((e) => { if (e.affectsConfiguration("renown")) { void refreshStatus(); panel?.refresh(); } }),
@@ -238,7 +239,7 @@ async function setLogin() {
 // --- New-pet celebration: when a sync mints new 1/1 pets, show the actual creatures -----------
 let celebration: vscode.WebviewPanel | undefined;
 
-function celebrateNewPets(seeds: string[], repo: string | null) {
+function celebrateNewPets(seeds: string[], repo: string | null, preview = false) {
   const base = endpoint(), who = login();
   if (!base || !who || seeds.length === 0) return;
   const origin = base.replace(/\/api$/, ""), enc = encodeURIComponent(who);
@@ -246,17 +247,34 @@ function celebrateNewPets(seeds: string[], repo: string | null) {
     celebration = vscode.window.createWebviewPanel("renownNewPet", "🎉 New pet!", { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, { enableScripts: false, enableCommandUris: true });
     celebration.onDidDispose(() => { celebration = undefined; });
   }
-  celebration.title = seeds.length > 1 ? `🎉 ${seeds.length} new pets!` : "🎉 New pet!";
+  celebration.title = preview ? "🐾 Pet preview" : seeds.length > 1 ? `🎉 ${seeds.length} new pets!` : "🎉 New pet!";
   const cards = seeds.slice(0, 6)
-    .map((s) => `<a href="${origin}/profile/${enc}" title="Open your profile"><img class="pet" src="${origin}/pet/${encodeURIComponent(s)}/card.svg" alt="new pet"></a>`)
+    .map((s) => `<a href="${origin}/profile/${enc}" title="Open your profile"><img class="pet" src="${origin}/pet/${encodeURIComponent(s)}/card.svg" alt="${preview ? "pet" : "new pet"}"></a>`)
     .join("");
-  const body = `
-    <h1>You hatched ${seeds.length === 1 ? "a new pet" : `${seeds.length} new pets`}! 🎉</h1>
-    <p class="muted">Minted from your latest verified commits${repo ? ` on ${escHtml(repo)}` : ""}. Each is a 1/1 — procedurally generated from the commit, so no one else has it.</p>
+  const head = preview
+    ? `<h1>This is what a hatch looks like 🐾</h1><p class="muted">A preview of your celebration. Commit verified work and a brand-new 1/1 pops up here automatically.</p>`
+    : `<h1>You hatched ${seeds.length === 1 ? "a new pet" : `${seeds.length} new pets`}! 🎉</h1><p class="muted">Minted from your latest verified commits${repo ? ` on ${escHtml(repo)}` : ""}. Each is a 1/1 — procedurally generated from the commit, so no one else has it.</p>`;
+  const body = `${head}
     <div class="pets">${cards}</div>
     <p style="margin-top:18px"><a class="btn" href="${origin}/profile/${enc}">See all your pets →</a></p>`;
   celebration.webview.html = celebrationShell(origin, body);
   celebration.reveal(vscode.ViewColumn.Beside, true);
+}
+
+// Opens the celebration with your existing signature pet — no new commit required. For demos,
+// screenshots, and just confirming the surface works.
+async function previewPet() {
+  const base = endpoint(), who = login();
+  if (!base) { void vscode.window.showWarningMessage("Renown: set renown.endpoint in Settings."); return; }
+  if (!who) { await setLogin(); if (!login()) return; }
+  try {
+    const r = await fetch(`${base}/profile/${encodeURIComponent(login())}`, { signal: AbortSignal.timeout(8000) });
+    const p = r.ok ? (await r.json()) as { rarestPetSeed?: string; avatarSeed?: string; showcaseSeeds?: unknown[] } : {};
+    const seeds = [p.rarestPetSeed, p.avatarSeed, ...(Array.isArray(p.showcaseSeeds) ? p.showcaseSeeds : [])]
+      .filter((s): s is string => typeof s === "string" && s.length > 0);
+    if (!seeds.length) { void vscode.window.showInformationMessage("Renown: no pets yet to preview — commit verified work to hatch your first."); return; }
+    celebrateNewPets([seeds[0]], null, true);
+  } catch { void vscode.window.showWarningMessage(`Renown: couldn't reach the renown server (${base}).`); }
 }
 
 function celebrationShell(origin: string, body: string): string {

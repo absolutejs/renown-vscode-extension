@@ -17,6 +17,7 @@
       { "command": "renown.syncNow", "title": "Renown: Sync This Repo Now", "icon": "$(sync)" },
       { "command": "renown.setLogin", "title": "Renown: Set GitHub Login" },
       { "command": "renown.refreshPanel", "title": "Renown: Refresh Panel", "icon": "$(refresh)" },
+      { "command": "renown.previewPet", "title": "Renown: Preview New Pet" },
       { "command": "renown.openSettings", "title": "Renown: Open Settings" }
     ],
     "viewsContainers": {
