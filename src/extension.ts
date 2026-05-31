@@ -21,6 +21,8 @@ let statusItem: vscode.StatusBarItem;
 const timers: NodeJS.Timeout[] = [];
 const activeMinutes = new Map<string, number>();   // workspace folder → accumulated active minutes
 const lastEditAt = new Map<string, number>();       // workspace folder → last edit timestamp (ms)
+const lastSyncAt = new Map<string, number>();       // workspace folder → last sync timestamp (ms)
+let syncingRepo: string | null = null;              // non-null while a sync is in flight (drives the spinner)
 
 const cfg = () => vscode.workspace.getConfiguration("renown");
 // Once renown is hosted, set HOSTED_DEFAULT to the public API base (e.g. https://renown.app/api).
@@ -44,11 +46,12 @@ export function activate(context: vscode.ExtensionContext) {
     statusItem,
     vscode.window.registerWebviewViewProvider("renown.panel", panel),
     vscode.commands.registerCommand("renown.openProfile", openProfile),
-    vscode.commands.registerCommand("renown.syncNow", () => syncActiveRepo(true)),
+    vscode.commands.registerCommand("renown.syncNow", () => syncActiveRepo("manual")),
     vscode.commands.registerCommand("renown.setLogin", setLogin),
     vscode.commands.registerCommand("renown.openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", "renown")),
     vscode.commands.registerCommand("renown.refreshPanel", () => panel?.refresh()),
     vscode.workspace.onDidChangeTextDocument((e) => onEdit(e.document)),
+    vscode.workspace.onDidSaveTextDocument((doc) => onEdit(doc)),   // saving also counts as activity
     vscode.workspace.onDidChangeConfiguration((e) => { if (e.affectsConfiguration("renown")) { void refreshStatus(); panel?.refresh(); } }),
     vscode.window.onDidChangeActiveTextEditor(() => panel?.refresh()),   // board follows the active repo
   );
@@ -69,17 +72,20 @@ function onEdit(doc: vscode.TextDocument) {
 }
 
 // Once a minute: any repo edited in the last minute counts as one active minute; once a repo
-// crosses heartbeatMinutes of activity, refresh its renown and reset its counter.
+// crosses heartbeatMinutes of activity, refresh its renown and reset its counter. A cooldown of
+// one full window stops a repo from re-syncing back-to-back while you keep typing.
 async function tickHeartbeat() {
-  if (!endpoint() || !login()) return;
+  if (!endpoint() || !login() || syncingRepo !== null) return;
   const threshold = Math.max(1, cfg().get<number>("heartbeatMinutes") ?? 5);
+  const cooldownMs = threshold * 60_000;
   const now = Date.now();
   for (const [folderPath, ts] of [...lastEditAt]) {
     if (now - ts > 60_000) continue;   // no edit in the last minute → idle this tick
     const mins = (activeMinutes.get(folderPath) ?? 0) + 1;
     if (mins >= threshold) {
       activeMinutes.delete(folderPath);
-      await syncRepoAt(folderPath, false);
+      if (now - (lastSyncAt.get(folderPath) ?? 0) < cooldownMs) continue;   // synced recently → hold off
+      await syncRepoAt(folderPath, "heartbeat");
     } else {
       activeMinutes.set(folderPath, mins);
     }
@@ -95,42 +101,61 @@ async function repoOf(folderPath: string): Promise<string | null> {
   } catch { return null; }
 }
 
-async function syncRepoAt(folderPath: string, notify: boolean) {
+type SyncMode = "manual" | "heartbeat";
+
+async function syncRepoAt(folderPath: string, mode: SyncMode) {
   const base = endpoint(), who = login();
   if (!base || !who) return;
   const repo = await repoOf(folderPath);
+  lastSyncAt.set(folderPath, Date.now());
+  showSyncing(repo);                                                       // subtle $(sync~spin) in the status bar
   const post = (path: string, body: unknown) =>
     fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).catch(() => undefined);
-  const vr = await post("/verify", { login: who });                        // global renown (base + attribution + pets + skills)
   let delta = 0, newPets = 0;
-  if (vr?.ok) {
-    try {
-      const j = (await vr.json()) as { attributionDelta?: number; newPetSeeds?: unknown[]; newPets?: number };
-      delta = Number(j.attributionDelta ?? 0);
-      newPets = Array.isArray(j.newPetSeeds) ? j.newPetSeeds.length : Number(j.newPets ?? 0);
-    } catch { /* non-JSON / throttled */ }
+  try {
+    const vr = await post("/verify", { login: who });                      // global renown (base + attribution + pets + skills)
+    if (vr?.ok) {
+      try {
+        const j = (await vr.json()) as { attributionDelta?: number; newPetSeeds?: unknown[]; newPets?: number };
+        delta = Number(j.attributionDelta ?? 0);
+        newPets = Array.isArray(j.newPetSeeds) ? j.newPetSeeds.length : Number(j.newPets ?? 0);
+      } catch { /* non-JSON / throttled */ }
+    }
+    if (repo) await post("/ci/repo-sync", { repo, logins: [who] });        // this repo's verified board entry
+  } finally {
+    syncingRepo = null;
   }
-  if (repo) await post("/ci/repo-sync", { repo, logins: [who] });          // this repo's verified board entry
-  if (notify) {
-    const bits: string[] = [];
-    if (delta > 0) bits.push(`+${fmt(delta)} renown`);
-    if (newPets > 0) bits.push(`+${newPets} pet${newPets === 1 ? "" : "s"}`);
-    vscode.window.showInformationMessage(bits.length ? `Renown: ${bits.join(" · ")}${repo ? ` on ${repo}` : ""} 🎉` : `Renown: synced${repo ? ` ${repo}` : ""} — no new attribution since last sync.`);
-  }
+  // Manual sync always reports (incl. the "nothing new" case so the click feels acknowledged);
+  // a background heartbeat only interrupts you when you actually earned something.
+  const bits: string[] = [];
+  if (delta > 0) bits.push(`+${fmt(delta)} renown`);
+  if (newPets > 0) bits.push(`+${newPets} pet${newPets === 1 ? "" : "s"}`);
+  if (bits.length) vscode.window.showInformationMessage(`Renown: ${bits.join(" · ")}${repo ? ` on ${repo}` : ""} 🎉`);
+  else if (mode === "manual") vscode.window.showInformationMessage(`Renown: synced${repo ? ` ${repo}` : ""} — no new attribution since last sync.`);
   await refreshStatus();
   panel?.refresh();
 }
 
-async function syncActiveRepo(notify: boolean) {
+async function syncActiveRepo(mode: SyncMode) {
   const active = vscode.window.activeTextEditor?.document.uri;
   const folder = (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
   if (!folder) { vscode.window.showWarningMessage("Renown: open a folder/repo first."); return; }
   if (!endpoint()) { vscode.window.showWarningMessage("Renown: set renown.endpoint in Settings."); return; }
   if (!login()) { await setLogin(); if (!login()) return; }
-  await syncRepoAt(folder.uri.fsPath, notify);
+  await syncRepoAt(folder.uri.fsPath, mode);
+}
+
+// While a sync is in flight, show a spinner in the status bar (refreshStatus yields to it).
+function showSyncing(repo: string | null) {
+  syncingRepo = repo ?? "";
+  const name = repo ? repo.split("/")[1] : "";
+  statusItem.text = `$(sync~spin) renown${name ? ` · ${name}` : ""}`;
+  statusItem.tooltip = `Syncing your renown${repo ? ` for ${repo}` : ""}…`;
+  statusItem.show();
 }
 
 async function refreshStatus() {
+  if (syncingRepo !== null) return;   // a sync is showing its spinner — don't overwrite it
   const base = endpoint(), who = login();
   // Always show a presence so the extension is discoverable even before it's configured.
   if (!base) {
@@ -159,13 +184,28 @@ async function refreshStatus() {
     } else {
       const wk = Number(p.attributionDelta ?? 0);
       statusItem.text = `$(flame) ${fmt(p.currentScore ?? 0)} renown${wk > 0 ? ` $(arrow-up)${fmt(wk)}` : ""}`;
-      statusItem.tooltip = `@${who} · total level ${p.totalLevel ?? 0} · ${fmt(p.petsCount ?? 0)} pets${wk > 0 ? `\n+${fmt(wk)} renown this week` : ""}\nClick to open your renown profile`;
+      statusItem.tooltip = `@${who} · total level ${p.totalLevel ?? 0} · ${fmt(p.petsCount ?? 0)} pets${wk > 0 ? `\n+${fmt(wk)} renown this week` : ""}${heartbeatHint()}\nClick to open your renown profile`;
     }
   } catch {
     statusItem.text = "$(flame) renown $(warning)";
     statusItem.tooltip = `Couldn't reach the renown server (${base}).`;
   }
   statusItem.show();
+}
+
+// A compact line for the status tooltip: where the active repo sits in its heartbeat window, or
+// when it last synced. Surfaces the otherwise-invisible activity tracker.
+function heartbeatHint(): string {
+  const active = vscode.window.activeTextEditor?.document.uri;
+  const folder = (active && vscode.workspace.getWorkspaceFolder(active)) ?? vscode.workspace.workspaceFolders?.[0];
+  if (!folder) return "";
+  const path = folder.uri.fsPath;
+  const threshold = Math.max(1, cfg().get<number>("heartbeatMinutes") ?? 5);
+  const mins = activeMinutes.get(path) ?? 0;
+  if (mins > 0) return `\nactivity: ${mins}/${threshold} min → auto-sync`;
+  const last = lastSyncAt.get(path);
+  if (last) { const ago = Math.round((Date.now() - last) / 60_000); return `\nlast synced ${ago < 1 ? "just now" : `${ago}m ago`}`; }
+  return "";
 }
 
 function openProfile() {
