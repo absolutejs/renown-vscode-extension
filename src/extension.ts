@@ -20,7 +20,7 @@ const activeMinutes = new Map<string, number>();   // workspace folder → accum
 const lastEditAt = new Map<string, number>();       // workspace folder → last edit timestamp (ms)
 
 const cfg = () => vscode.workspace.getConfiguration("renown");
-const endpoint = () => (cfg().get<string>("endpoint") ?? "").replace(/\/+$/, "");
+const endpoint = () => (cfg().get<string>("endpoint") ?? "").trim().replace(/\/+$/, "");
 const login = () => (cfg().get<string>("login") ?? "").trim();
 const fmt = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1_000)}k` : n.toLocaleString("en-US"));
 
