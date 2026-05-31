@@ -17,6 +17,7 @@
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 
 const execFileP = promisify(execFile);
 
@@ -27,6 +28,18 @@ const lastEditAt = new Map<string, number>();       // workspace folder → last
 const lastSyncAt = new Map<string, number>();       // workspace folder → last sync timestamp (ms)
 let syncingRepo: string | null = null;              // non-null while a sync is in flight (drives the spinner)
 let ghSession: vscode.AuthenticationSession | undefined;   // VS Code's GitHub session, when signed in
+let ctx: vscode.ExtensionContext;
+
+// A stable per-install id that anchors this client's player row on the server (same role as the
+// CLI's local identity). On first link it seeds a fresh player; if this GitHub already maps to a
+// player (web OAuth / CLI), the server attaches to that existing one and ignores this id.
+function playerId(): string {
+  let id = ctx.globalState.get<string>("renown.playerId");
+  if (!id) { id = randomUUID(); void ctx.globalState.update("renown.playerId", id); }
+  return id;
+}
+// Whether we've completed the server-side link (account is github-verified → ranks).
+const serverVerified = () => ctx.globalState.get<boolean>("renown.verified") === true;
 
 const cfg = () => vscode.workspace.getConfiguration("renown");
 // Once renown is hosted, set HOSTED_DEFAULT to the public API base (e.g. https://renown.app/api).
@@ -49,6 +62,7 @@ const isVerified = () => { const v = verifiedLogin(); return !!v && login().toLo
 const fmt = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1_000)}k` : n.toLocaleString("en-US"));
 
 export function activate(context: vscode.ExtensionContext) {
+  ctx = context;
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusItem.command = "renown.openProfile";
   panel = new RenownPanel();
@@ -58,6 +72,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("renown.openProfile", openProfile),
     vscode.commands.registerCommand("renown.syncNow", () => syncActiveRepo("manual")),
     vscode.commands.registerCommand("renown.signIn", () => signIn(true)),
+    vscode.commands.registerCommand("renown.verify", () => verifyWithServer(true)),
     vscode.commands.registerCommand("renown.setLogin", setLogin),
     vscode.commands.registerCommand("renown.openSettings", () => vscode.commands.executeCommand("workbench.action.openSettings", "renown")),
     vscode.commands.registerCommand("renown.refreshPanel", () => panel?.refresh()),
@@ -207,7 +222,7 @@ async function refreshStatus() {
     } else {
       const wk = Number(p.attributionDelta ?? 0);
       statusItem.text = `$(flame) ${fmt(p.currentScore ?? 0)} renown${wk > 0 ? ` $(arrow-up)${fmt(wk)}` : ""}`;
-      const ident = isVerified() ? `@${who} $(verified-filled) signed in with GitHub` : `@${who} (set via renown.login)`;
+      const ident = isVerified() ? `@${who} $(verified-filled) signed in with GitHub${serverVerified() ? " · ranked" : ""}` : `@${who} (set via renown.login)`;
       statusItem.tooltip = `${ident} · total level ${p.totalLevel ?? 0} · ${fmt(p.petsCount ?? 0)} pets${wk > 0 ? `\n+${fmt(wk)} renown this week` : ""}${heartbeatHint()}\nClick to open your renown profile`;
     }
   } catch {
@@ -254,9 +269,43 @@ async function signIn(interactive: boolean) {
     if (override && override.toLowerCase() === session.account.label.toLowerCase()) {
       await cfg().update("login", "", vscode.ConfigurationTarget.Global);
     }
-    if (interactive) void vscode.window.showInformationMessage(`Renown: signed in as @${session.account.label}.`);
+    if (interactive) {
+      // Offer the server-side step explicitly — it sends the GitHub token to the renown server
+      // (used only to read /user, never stored) so the account becomes verified and ranks.
+      void vscode.window.showInformationMessage(`Renown: signed in as @${session.account.label}.`, "Verify so I rank")
+        .then((pick) => { if (pick === "Verify so I rank") void verifyWithServer(true); });
+    }
   } catch (e) {
     if (interactive) void vscode.window.showWarningMessage(`Renown: GitHub sign-in failed — ${e instanceof Error ? e.message : String(e)}`);
+  }
+  void refreshStatus();
+  panel?.refresh();
+}
+
+// Server-side verification: present the VS Code GitHub session token to the renown server's
+// browserless link endpoint (the same one the CLI uses). The server verifies it against GitHub,
+// marks the account github-verified, and recomputes the authoritative score — so the account
+// actually ranks. The token is only read server-side, not stored.
+async function verifyWithServer(interactive: boolean) {
+  const base = endpoint();
+  if (!base) { if (interactive) void vscode.window.showWarningMessage("Renown: set renown.endpoint in Settings first."); return; }
+  if (!ghSession) { await signIn(true); if (!ghSession) return; }
+  const token = ghSession?.accessToken;
+  if (!token) { if (interactive) void vscode.window.showWarningMessage("Renown: sign in with GitHub first."); return; }
+  try {
+    const r = await fetch(`${base}/cli/link`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ playerId: playerId(), token }), signal: AbortSignal.timeout(15000) });
+    const j = (await r.json().catch(() => ({}))) as { ok?: boolean; login?: string; verifiedScore?: number; needsMerge?: boolean; error?: string };
+    if (j.ok) {
+      await ctx.globalState.update("renown.verified", true);
+      void vscode.window.showInformationMessage(`Renown: verified @${j.login} — your account now ranks (${fmt(Number(j.verifiedScore ?? 0))} renown).`);
+    } else if (j.needsMerge) {
+      const pick = await vscode.window.showWarningMessage(`Renown: @${j.login} is already on another renown account. Confirm a merge from the web settings to claim it here.`, "Open renown");
+      if (pick === "Open renown") void vscode.env.openExternal(vscode.Uri.parse(base.replace(/\/api$/, "")));
+    } else if (interactive) {
+      void vscode.window.showWarningMessage(`Renown: verification failed — ${j.error ?? `server ${r.status}`}.`);
+    }
+  } catch {
+    if (interactive) void vscode.window.showWarningMessage(`Renown: couldn't reach the renown server (${base}).`);
   }
   void refreshStatus();
   panel?.refresh();
@@ -399,6 +448,7 @@ async function renderPanel(): Promise<string> {
     ${recap && !recap.error
       ? `<div class="stat">this week: <b>+${fmt(wk)}</b> renown · <b>${achs.length}</b> achievement${achs.length === 1 ? "" : "s"}</div>`
       : `<p class="muted">@${escHtml(who)} isn't on renown yet — link your account and commit.</p>`}
+    ${isVerified() && !serverVerified() ? `<p class="muted" style="margin-top:8px">Not ranking yet — verify so your renown counts on the boards.</p><a class="btn" href="command:renown.verify">✓ Verify so you rank</a>` : ""}
     <a class="btn" href="command:renown.syncNow">⟳ Sync this repo</a>
     ${recap && !recap.error
       ? `<h3>Your pets</h3><a href="${origin}/profile/${enc}" title="Open your profile"><img src="${origin}/profile/${enc}/pets.svg" alt="your pets"></a>`

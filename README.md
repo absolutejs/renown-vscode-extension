@@ -37,7 +37,8 @@ Renown turns your verified GitHub contributions into a score, levels, and proced
    ```
    Then open the folder in VS Code and press **F5** to launch the Extension Development Host.
 2. **Sign in** — run **`Renown: Sign in with GitHub`** (or click *Renown: sign in* in the status bar). This uses VS Code's built-in GitHub auth — no separate account, no token to paste.
-3. **Point it at a renown server** — set **`renown.endpoint`** to your server's API base. During local development that's `http://localhost:7777/api` against a `bun run start` in [`renown/web`](https://github.com/absolutejs/renown). *(Once renown is hosted, this defaults to the hosted URL and won't need setting.)*
+3. **Verify so you rank** — accept the **Verify so I rank** prompt after signing in (or run **`Renown: Verify with Renown Server`**). This presents your GitHub session token to the server, which confirms it against GitHub, marks your account verified, and starts ranking you on the boards. The token is only read server-side to confirm your login — it's never stored.
+4. **Point it at a renown server** — set **`renown.endpoint`** to your server's API base. During local development that's `http://localhost:7777/api` against a `bun run start` in [`renown/web`](https://github.com/absolutejs/renown). *(Once renown is hosted, this defaults to the hosted URL and won't need setting.)*
 
 That's it — the HUD lights up, and editing a repo starts earning renown.
 
@@ -48,6 +49,7 @@ That's it — the HUD lights up, and editing a repo starts earning renown.
 | Command | What it does |
 | --- | --- |
 | **Renown: Sign in with GitHub** | Authenticate via VS Code's GitHub provider (proven identity). |
+| **Renown: Verify with Renown Server** | Link your GitHub to the server so your account ranks (confirms your token; never stores it). |
 | **Renown: Sync This Repo Now** | Recompute your renown for the active repo immediately. |
 | **Renown: Preview New Pet** | Open the celebration with your signature pet — no commit needed (handy for a look). |
 | **Renown: Open My Profile** | Open your public renown profile in the browser. |
